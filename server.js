@@ -16,7 +16,7 @@ const server = http.createServer((req, res) => {
   if (m) {
     const r = rooms.get(m[1].toUpperCase());
     res.setHeader('Content-Type', 'application/json');
-    res.end(JSON.stringify({ exists: !!r, count: r ? r.players.size : 0, max: MAX, full: !!r && r.players.size >= MAX }));
+    res.end(JSON.stringify({ exists: !!r, count: r ? r.players.size : 0, max: MAX, full: !!r && r.players.size >= MAX, colors: r ? [...r.players.values()].map(c => c.color) : [] }));
     return;
   }
   const f = path.join(PUBLIC, u.pathname === '/' ? 'index.html' : path.normalize(u.pathname).replace(/^(\.\.[\/\\])+/, ''));
@@ -36,6 +36,8 @@ function frame(str, op = 1) {
 }
 const send = (c, o) => { if (c.sock.destroyed) return; const f = frame(JSON.stringify(o)); if (f) c.sock.write(f); };
 const bcast = (room, o, except) => { for (const c of room.players.values()) if (c.id !== except) send(c, o); };
+const rgb = h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16));
+const colorDist = (a, b) => { const x = rgb(a), y = rgb(b); return Math.hypot(x[0] - y[0], x[1] - y[1], x[2] - y[2]) };
 const pub = c => ({ id: c.id, name: c.name, color: c.color, s: c.st });
 
 server.on('upgrade', (req, sock) => {
@@ -47,15 +49,16 @@ server.on('upgrade', (req, sock) => {
   const bad = s => sock.end('HTTP/1.1 ' + s + '\r\nConnection: close\r\n\r\n');
   if (!key || code.length !== 4) { sock.destroy(); return; }
   let room = rooms.get(code);
-  if (create) { if (room) return bad('409 Code taken'); room = { players: new Map(), host: 0, started: false }; }
+  if (create) { if (room) return bad('409 Code taken'); room = { players: new Map(), host: 0, started: false, co: false }; }
   else if (!room) return bad('404 No such lobby');
   if (room.players.size >= MAX) return bad('503 Lobby full');
+  for (const o of room.players.values()) if (colorDist(o.color, color) < 80) return bad('409 Color taken');
   sock.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ' +
     crypto.createHash('sha1').update(key + GUID).digest('base64') + '\r\n\r\n');
   sock.setNoDelay(true);
   const c = { id: nextId++, name, color, sock, buf: Buffer.alloc(0), st: null, last: 0 };
   if (create) { rooms.set(code, room); room.host = c.id; }
-  send(c, { t: 'welcome', id: c.id, room: code, host: room.host, started: room.started, players: [...room.players.values()].map(pub) });
+  send(c, { t: 'welcome', id: c.id, room: code, host: room.host, started: room.started, co: room.co, players: [...room.players.values()].map(pub) });
   room.players.set(c.id, c);
   bcast(room, { t: 'join', id: c.id, name, color }, c.id);
 
@@ -87,10 +90,17 @@ server.on('upgrade', (req, sock) => {
     if (m.t === 'state') {
       if (now - c.last < 30) return; c.last = now;
       const n = v => (typeof v === 'number' && isFinite(v)) ? v : 0;
-      c.st = { x: n(m.x), y: n(m.y), z: n(m.z), yaw: n(m.yaw), pitch: n(m.pitch), hp: n(m.hp), mode: String(m.mode || '').slice(0, 12) };
+      c.st = { x: n(m.x), y: n(m.y), z: n(m.z), yaw: n(m.yaw), pitch: n(m.pitch), hp: n(m.hp), mode: String(m.mode || '').slice(0, 12), f: m.f ? 1 : 0, g: m.g ? 1 : 0 };
       bcast(room, { t: 'state', id: c.id, s: c.st }, c.id);
+    } else if (m.t === 'keys') {
+      if (now - (c.lastK || 0) < 70 || !Array.isArray(m.k)) return; c.lastK = now;
+      bcast(room, { t: 'keys', id: c.id, k: m.k.slice(0, 60) }, c.id);
+    } else if (m.t === 'act' && ['talk', 'board', 'launch'].includes(m.a)) {
+      bcast(room, { t: 'act', a: m.a, id: c.id }, c.id);
+    } else if (m.t === 'khit') {
+      const v = room.players.get(m.o); if (v) send(v, { t: 'khit', k: m.k, from: c.id });
     } else if (m.t === 'start' && room.host === c.id) {
-      room.started = true; bcast(room, { t: 'start' });
+      room.started = true; room.co = !!m.co; bcast(room, { t: 'start', co: room.co });
     } else if (m.t === 'kick' && room.host === c.id && m.id !== c.id) {
       const v = room.players.get(m.id);
       if (v) { send(v, { t: 'kicked' }); setTimeout(() => v.sock.destroy(), 100); room.players.delete(v.id); bcast(room, { t: 'leave', id: v.id }); }
