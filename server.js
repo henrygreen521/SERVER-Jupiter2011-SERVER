@@ -1,16 +1,24 @@
-// Jupiter Incident multiplayer relay server. Zero dependencies (Node 16+).
-// Run: node server.js   (PORT env var sets the port, default 8080)
+// Jupiter Incident multiplayer server. Zero dependencies (Node 16+).
+// Run: node server.js   (PORT sets the port, MAX_PLAYERS sets room size)
 const http = require('http'), crypto = require('crypto'), fs = require('fs'), path = require('path');
-const PORT = +process.env.PORT || 8080, MAX_PER_ROOM = +process.env.MAX_PLAYERS || 8;
+const PORT = +process.env.PORT || 8080, MAX = +process.env.MAX_PLAYERS || 8;
 const PUBLIC = path.join(__dirname, 'public');
 const GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
-const rooms = new Map(); // code -> Map(id -> client)
+const rooms = new Map(); // CODE -> { players: Map(id -> client), host: id, started: bool }
 let nextId = 1;
 
-/* ---------- static hosting: drop the game html in ./public/index.html ---------- */
+/* ---------- HTTP: game file + room lookup ---------- */
 const server = http.createServer((req, res) => {
   const u = new URL(req.url, 'http://x');
+  res.setHeader('Access-Control-Allow-Origin', '*');
   if (u.pathname === '/health') { res.end('ok'); return; }
+  const m = u.pathname.match(/^\/room\/([A-Za-z0-9]{4})$/);
+  if (m) {
+    const r = rooms.get(m[1].toUpperCase());
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify({ exists: !!r, count: r ? r.players.size : 0, max: MAX, full: !!r && r.players.size >= MAX }));
+    return;
+  }
   const f = path.join(PUBLIC, u.pathname === '/' ? 'index.html' : path.normalize(u.pathname).replace(/^(\.\.[\/\\])+/, ''));
   if (!f.startsWith(PUBLIC)) { res.writeHead(403); res.end(); return; }
   fs.readFile(f, (e, d) => {
@@ -26,26 +34,37 @@ function frame(str, op = 1) {
   const h = n < 126 ? Buffer.from([0x80 | op, n]) : n < 65536 ? Buffer.from([0x80 | op, 126, n >> 8, n & 255]) : null;
   return h ? Buffer.concat([h, p]) : null;
 }
-function send(c, obj) { if (c.sock.destroyed) return; const f = frame(JSON.stringify(obj)); if (f) c.sock.write(f); }
-function bcast(room, obj, except) { for (const c of room.values()) if (c.id !== except) send(c, obj); }
+const send = (c, o) => { if (c.sock.destroyed) return; const f = frame(JSON.stringify(o)); if (f) c.sock.write(f); };
+const bcast = (room, o, except) => { for (const c of room.players.values()) if (c.id !== except) send(c, o); };
+const pub = c => ({ id: c.id, name: c.name, color: c.color, s: c.st });
 
 server.on('upgrade', (req, sock) => {
   const u = new URL(req.url, 'http://x'), key = req.headers['sec-websocket-key'];
-  if (!key) { sock.destroy(); return; }
-  const room = (u.searchParams.get('room') || 'public').replace(/[^\w-]/g, '').slice(0, 24) || 'public';
-  const name = (u.searchParams.get('name') || 'Player').replace(/[^\w \-]/g, '').slice(0, 16) || 'Player';
-  const players = rooms.get(room) || new Map();
-  if (players.size >= MAX_PER_ROOM) { sock.end('HTTP/1.1 503 Room full\r\n\r\n'); return; }
+  const code = (u.searchParams.get('room') || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 4);
+  const create = u.searchParams.get('create') === '1';
+  const name = (u.searchParams.get('name') || '').replace(/[^\w \-]/g, '').trim().slice(0, 16) || 'Player';
+  let color = u.searchParams.get('color') || ''; if (!/^#[0-9a-fA-F]{6}$/.test(color)) color = '#ffffff';
+  const bad = s => sock.end('HTTP/1.1 ' + s + '\r\nConnection: close\r\n\r\n');
+  if (!key || code.length !== 4) { sock.destroy(); return; }
+  let room = rooms.get(code);
+  if (create) { if (room) return bad('409 Code taken'); room = { players: new Map(), host: 0, started: false }; }
+  else if (!room) return bad('404 No such lobby');
+  if (room.players.size >= MAX) return bad('503 Lobby full');
   sock.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ' +
     crypto.createHash('sha1').update(key + GUID).digest('base64') + '\r\n\r\n');
   sock.setNoDelay(true);
-  rooms.set(room, players);
-  const c = { id: nextId++, name, sock, buf: Buffer.alloc(0), st: null, last: 0 };
-  send(c, { t: 'welcome', id: c.id, room, players: [...players.values()].map(p => ({ id: p.id, name: p.name, s: p.st })) });
-  players.set(c.id, c);
-  bcast(players, { t: 'join', id: c.id, name }, c.id);
+  const c = { id: nextId++, name, color, sock, buf: Buffer.alloc(0), st: null, last: 0 };
+  if (create) { rooms.set(code, room); room.host = c.id; }
+  send(c, { t: 'welcome', id: c.id, room: code, host: room.host, started: room.started, players: [...room.players.values()].map(pub) });
+  room.players.set(c.id, c);
+  bcast(room, { t: 'join', id: c.id, name, color }, c.id);
 
-  const leave = () => { if (!players.delete(c.id)) return; bcast(players, { t: 'leave', id: c.id }); if (!players.size) rooms.delete(room); };
+  const leave = () => {
+    if (!room.players.delete(c.id)) return;
+    bcast(room, { t: 'leave', id: c.id });
+    if (!room.players.size) { rooms.delete(code); return; }
+    if (room.host === c.id) { room.host = Math.min(...room.players.keys()); bcast(room, { t: 'host', id: room.host }); }
+  };
   sock.on('data', d => {
     c.buf = Buffer.concat([c.buf, d]);
     if (c.buf.length > 1 << 16) { sock.destroy(); return; }
@@ -65,15 +84,16 @@ server.on('upgrade', (req, sock) => {
   function handle(txt) {
     let m; try { m = JSON.parse(txt) } catch (e) { return }
     const now = Date.now();
-    if (m.t === 'state') { // throttle to ~30/s; clamp to numbers
+    if (m.t === 'state') {
       if (now - c.last < 30) return; c.last = now;
       const n = v => (typeof v === 'number' && isFinite(v)) ? v : 0;
-      c.st = { x: n(m.x), y: n(m.y), z: n(m.z), yaw: n(m.yaw), pitch: n(m.pitch), hp: n(m.hp) };
-      bcast(players, { t: 'state', id: c.id, s: c.st }, c.id);
-    } else if (m.t === 'shot') {
-      bcast(players, { t: 'shot', id: c.id, x: +m.x || 0, y: +m.y || 0, z: +m.z || 0, dx: +m.dx || 0, dy: +m.dy || 0, dz: +m.dz || 0 }, c.id);
-    } else if (m.t === 'chat') {
-      bcast(players, { t: 'chat', id: c.id, name, text: String(m.text || '').slice(0, 120) });
+      c.st = { x: n(m.x), y: n(m.y), z: n(m.z), yaw: n(m.yaw), pitch: n(m.pitch), hp: n(m.hp), mode: String(m.mode || '').slice(0, 12) };
+      bcast(room, { t: 'state', id: c.id, s: c.st }, c.id);
+    } else if (m.t === 'start' && room.host === c.id) {
+      room.started = true; bcast(room, { t: 'start' });
+    } else if (m.t === 'kick' && room.host === c.id && m.id !== c.id) {
+      const v = room.players.get(m.id);
+      if (v) { send(v, { t: 'kicked' }); setTimeout(() => v.sock.destroy(), 100); room.players.delete(v.id); bcast(room, { t: 'leave', id: v.id }); }
     }
   }
   sock.on('close', leave); sock.on('error', leave);
