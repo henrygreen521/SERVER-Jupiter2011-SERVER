@@ -102,7 +102,7 @@ server.on('upgrade', (req, sock) => {
     if (m.t === 'state') {
       if (now - c.last < 30) return; c.last = now;
       const n = v => (typeof v === 'number' && isFinite(v)) ? v : 0;
-      c.st = { x: n(m.x), y: n(m.y), z: n(m.z), yaw: n(m.yaw), pitch: n(m.pitch), hp: n(m.hp), mode: String(m.mode || '').slice(0, 12), f: m.f ? 1 : 0, g: m.g ? 1 : 0, sf: m.sf ? 1 : 0, dn: m.dn ? 1 : 0 };
+      c.st = { x: n(m.x), y: n(m.y), z: n(m.z), yaw: n(m.yaw), pitch: n(m.pitch), hp: n(m.hp), mode: String(m.mode || '').slice(0, 12), f: m.f ? 1 : 0, g: m.g ? 1 : 0, sf: m.sf ? 1 : 0, dn: m.dn ? 1 : 0, pc: m.pc ? 1 : 0 };
       bcast(room, { t: 'state', id: c.id, s: c.st }, c.id);
     } else if (m.t === 'keys') {
       if (now - (c.lastK || 0) < 70 || !Array.isArray(m.k)) return; c.lastK = now;
